@@ -577,7 +577,7 @@ impl Explorer {
     }
 
     fn new_folder(&mut self, path: &str) -> Result<()> {
-        let path = helix_stdx::path::get_normalized_path(&PathBuf::from(path));
+        let path = helix_stdx::path::normalize(&PathBuf::from(path));
         std::fs::create_dir_all(&path)?;
         self.tree.refresh()?;
         self.reveal_file(path)
