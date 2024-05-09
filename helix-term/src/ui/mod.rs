@@ -2,13 +2,12 @@ mod completion;
 mod document;
 pub(crate) mod editor;
 mod explorer;
-mod fuzzy_match;
 mod info;
 pub mod lsp;
 mod markdown;
 pub mod menu;
 pub mod overlay;
-mod picker;
+pub mod picker;
 pub mod popup;
 mod prompt;
 mod spinner;
@@ -16,12 +15,13 @@ mod statusline;
 mod text;
 mod tree;
 
-use crate::compositor::{Component, Compositor};
+use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
 pub use completion::{Completion, CompletionItem};
 pub use editor::EditorView;
 pub use explorer::Explorer;
+use helix_stdx::rope;
 pub use markdown::Markdown;
 pub use menu::Menu;
 pub use picker::{DynamicPicker, FileLocation, Picker};
@@ -31,8 +31,6 @@ pub use spinner::{ProgressSpinners, Spinner};
 pub use text::Text;
 pub use tree::{TreeOp, TreeView, TreeViewItem};
 
-use helix_core::regex::Regex;
-use helix_core::regex::RegexBuilder;
 use helix_view::Editor;
 
 use std::path::PathBuf;
@@ -68,7 +66,22 @@ pub fn regex_prompt(
     prompt: std::borrow::Cow<'static, str>,
     history_register: Option<char>,
     completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
-    fun: impl Fn(&mut Editor, Regex, PromptEvent) + 'static,
+    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, PromptEvent) + 'static,
+) {
+    raw_regex_prompt(
+        cx,
+        prompt,
+        history_register,
+        completion_fn,
+        move |cx, regex, _, event| fun(cx, regex, event),
+    );
+}
+pub fn raw_regex_prompt(
+    cx: &mut crate::commands::Context,
+    prompt: std::borrow::Cow<'static, str>,
+    history_register: Option<char>,
+    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
+    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, &str, PromptEvent) + 'static,
 ) {
     let (view, doc) = current!(cx.editor);
     let doc_id = view.doc;
@@ -99,10 +112,13 @@ pub fn regex_prompt(
                         false
                     };
 
-                    match RegexBuilder::new(input)
-                        .case_insensitive(case_insensitive)
-                        .multi_line(true)
-                        .build()
+                    match rope::RegexBuilder::new()
+                        .syntax(
+                            rope::Config::new()
+                                .case_insensitive(case_insensitive)
+                                .multi_line(true),
+                        )
+                        .build(input)
                     {
                         Ok(regex) => {
                             let (view, doc) = current!(cx.editor);
@@ -115,7 +131,7 @@ pub fn regex_prompt(
                                 view.jumps.push((doc_id, snapshot.clone()));
                             }
 
-                            fun(cx.editor, regex, event);
+                            fun(cx, regex, input, event);
 
                             let (view, doc) = current!(cx.editor);
                             view.ensure_cursor_in_view(doc, config.scrolloff);
@@ -131,14 +147,12 @@ pub fn regex_prompt(
                                         move |_editor: &mut Editor, compositor: &mut Compositor| {
                                             let contents = Text::new(format!("{}", err));
                                             let size = compositor.size();
-                                            let mut popup = Popup::new("invalid-regex", contents)
+                                            let popup = Popup::new("invalid-regex", contents)
                                                 .position(Some(helix_core::Position::new(
                                                     size.height as usize - 2, // 2 = statusline + commandline
                                                     0,
                                                 )))
                                                 .auto_close(true);
-                                            popup.required_size((size.width, size.height));
-
                                             compositor.replace_or_push("invalid-regex", popup);
                                         },
                                     ));
@@ -178,8 +192,12 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
         .git_ignore(config.file_picker.git_ignore)
         .git_global(config.file_picker.git_global)
         .git_exclude(config.file_picker.git_exclude)
+        .sort_by_file_name(|name1, name2| name1.cmp(name2))
         .max_depth(config.file_picker.max_depth)
         .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks));
+
+    walk_builder.add_custom_ignore_filename(helix_loader::config_dir().join("ignore"));
+    walk_builder.add_custom_ignore_filename(".helix/ignore");
 
     // We want to exclude files that the editor can't handle yet
     let mut type_builder = TypesBuilder::new();
@@ -194,32 +212,16 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
         .build()
         .expect("failed to build excluded_types");
     walk_builder.types(excluded_types);
-
-    // We want files along with their modification date for sorting
-    let files = walk_builder.build().filter_map(|entry| {
+    let mut files = walk_builder.build().filter_map(|entry| {
         let entry = entry.ok()?;
-        // This is faster than entry.path().is_dir() since it uses cached fs::Metadata fetched by ignore/walkdir
-        if entry.file_type()?.is_file() {
-            Some(entry.into_path())
-        } else {
-            None
+        if !entry.file_type()?.is_file() {
+            return None;
         }
+        Some(entry.into_path())
     });
-
-    // Cap the number of files if we aren't in a git project, preventing
-    // hangs when using the picker in your home directory
-    let mut files: Vec<PathBuf> = if root.join(".git").exists() {
-        files.collect()
-    } else {
-        // const MAX: usize = 8192;
-        const MAX: usize = 100_000;
-        files.take(MAX).collect()
-    };
-    files.sort();
-
     log::debug!("file_picker init {:?}", Instant::now().duration_since(now));
 
-    Picker::new(files, root, move |cx, path: &PathBuf, action| {
+    let picker = Picker::new(Vec::new(), root, move |cx, path: &PathBuf, action| {
         if let Err(e) = cx.editor.open(path, action) {
             let err = if let Some(err) = e.source() {
                 format!("{}", err)
@@ -229,20 +231,41 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
             cx.editor.set_error(err);
         }
     })
-    .with_preview(|_editor, path| Some((path.clone().into(), None)))
+    .with_preview(|_editor, path| Some((path.clone().into(), None)));
+    let injector = picker.injector();
+    let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
+
+    let mut hit_timeout = false;
+    for file in &mut files {
+        if injector.push(file).is_err() {
+            break;
+        }
+        if std::time::Instant::now() >= timeout {
+            hit_timeout = true;
+            break;
+        }
+    }
+    if hit_timeout {
+        std::thread::spawn(move || {
+            for file in files {
+                if injector.push(file).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    picker
 }
 
 pub mod completers {
     use crate::ui::prompt::Completion;
-    use fuzzy_matcher::skim::SkimMatcherV2 as Matcher;
-    use fuzzy_matcher::FuzzyMatcher;
+    use helix_core::fuzzy::fuzzy_match;
     use helix_core::syntax::LanguageServerFeature;
     use helix_view::document::SCRATCH_BUFFER_NAME;
     use helix_view::theme;
     use helix_view::{editor::Config, Editor};
     use once_cell::sync::Lazy;
     use std::borrow::Cow;
-    use std::cmp::Reverse;
 
     pub type Completer = fn(&Editor, &str) -> Vec<Completion>;
 
@@ -251,31 +274,16 @@ pub mod completers {
     }
 
     pub fn buffer(editor: &Editor, input: &str) -> Vec<Completion> {
-        let mut names: Vec<_> = editor
-            .documents
-            .values()
-            .map(|doc| {
-                let name = doc
-                    .relative_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| String::from(SCRATCH_BUFFER_NAME));
-                ((0..), Cow::from(name))
-            })
-            .collect();
+        let names = editor.documents.values().map(|doc| {
+            doc.relative_path()
+                .map(|p| p.display().to_string().into())
+                .unwrap_or_else(|| Cow::from(SCRATCH_BUFFER_NAME))
+        });
 
-        let matcher = Matcher::default();
-
-        let mut matches: Vec<_> = names
+        fuzzy_match(input, names, true)
             .into_iter()
-            .filter_map(|(_range, name)| {
-                matcher.fuzzy_match(&name, input).map(|score| (name, score))
-            })
-            .collect();
-
-        matches.sort_unstable_by_key(|(_file, score)| Reverse(*score));
-        names = matches.into_iter().map(|(name, _)| ((0..), name)).collect();
-
-        names
+            .map(|(name, _)| ((0..), name))
+            .collect()
     }
 
     pub fn theme(_editor: &Editor, input: &str) -> Vec<Completion> {
@@ -288,26 +296,10 @@ pub mod completers {
         names.sort();
         names.dedup();
 
-        let mut names: Vec<_> = names
+        fuzzy_match(input, names, false)
             .into_iter()
-            .map(|name| ((0..), Cow::from(name)))
-            .collect();
-
-        let matcher = Matcher::default();
-
-        let mut matches: Vec<_> = names
-            .into_iter()
-            .filter_map(|(_range, name)| {
-                matcher.fuzzy_match(&name, input).map(|score| (name, score))
-            })
-            .collect();
-
-        matches.sort_unstable_by(|(name1, score1), (name2, score2)| {
-            (Reverse(*score1), name1).cmp(&(Reverse(*score2), name2))
-        });
-        names = matches.into_iter().map(|(name, _)| ((0..), name)).collect();
-
-        names
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
     }
 
     /// Recursive function to get all keys from this value and add them to vec
@@ -334,15 +326,7 @@ pub mod completers {
             keys
         });
 
-        let matcher = Matcher::default();
-
-        let mut matches: Vec<_> = KEYS
-            .iter()
-            .filter_map(|name| matcher.fuzzy_match(name, input).map(|score| (name, score)))
-            .collect();
-
-        matches.sort_unstable_by_key(|(_file, score)| Reverse(*score));
-        matches
+        fuzzy_match(input, &*KEYS, false)
             .into_iter()
             .map(|(name, _)| ((0..), name.into()))
             .collect()
@@ -369,37 +353,21 @@ pub mod completers {
     }
 
     pub fn language(editor: &Editor, input: &str) -> Vec<Completion> {
-        let matcher = Matcher::default();
-
         let text: String = "text".into();
 
-        let language_ids = editor
-            .syn_loader
+        let loader = editor.syn_loader.load();
+        let language_ids = loader
             .language_configs()
             .map(|config| &config.language_id)
             .chain(std::iter::once(&text));
 
-        let mut matches: Vec<_> = language_ids
-            .filter_map(|language_id| {
-                matcher
-                    .fuzzy_match(language_id, input)
-                    .map(|score| (language_id, score))
-            })
-            .collect();
-
-        matches.sort_unstable_by(|(language1, score1), (language2, score2)| {
-            (Reverse(*score1), language1).cmp(&(Reverse(*score2), language2))
-        });
-
-        matches
+        fuzzy_match(input, language_ids, false)
             .into_iter()
-            .map(|(language, _score)| ((0..), language.clone().into()))
+            .map(|(name, _)| ((0..), name.to_owned().into()))
             .collect()
     }
 
     pub fn lsp_workspace_command(editor: &Editor, input: &str) -> Vec<Completion> {
-        let matcher = Matcher::default();
-
         let Some(options) = doc!(editor)
             .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
             .find_map(|ls| ls.capabilities().execute_command_provider.as_ref())
@@ -407,23 +375,9 @@ pub mod completers {
             return vec![];
         };
 
-        let mut matches: Vec<_> = options
-            .commands
-            .iter()
-            .filter_map(|command| {
-                matcher
-                    .fuzzy_match(command, input)
-                    .map(|score| (command, score))
-            })
-            .collect();
-
-        matches.sort_unstable_by(|(command1, score1), (command2, score2)| {
-            (Reverse(*score1), command1).cmp(&(Reverse(*score2), command2))
-        });
-
-        matches
+        fuzzy_match(input, &options.commands, false)
             .into_iter()
-            .map(|(command, _score)| ((0..), command.clone().into()))
+            .map(|(name, _)| ((0..), name.to_owned().into()))
             .collect()
     }
 
@@ -474,7 +428,7 @@ pub mod completers {
         use std::path::Path;
 
         let is_tilde = input == "~";
-        let path = helix_core::path::expand_tilde(Path::new(input));
+        let path = helix_stdx::path::expand_tilde(Path::new(input));
 
         let (dir, file_name) = if input.ends_with(std::path::MAIN_SEPARATOR) {
             (path, None)
@@ -493,9 +447,9 @@ pub mod completers {
                 path
             } else {
                 match path.parent() {
-                    Some(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
+                    Some(path) if !path.as_os_str().is_empty() => Cow::Borrowed(path),
                     // Path::new("h")'s parent is Some("")...
-                    _ => helix_loader::current_working_dir(),
+                    _ => Cow::Owned(helix_stdx::env::current_working_dir()),
                 }
             };
 
@@ -504,7 +458,7 @@ pub mod completers {
 
         let end = input.len()..;
 
-        let mut files: Vec<_> = WalkBuilder::new(&dir)
+        let files = WalkBuilder::new(&dir)
             .hidden(false)
             .follow_links(false) // We're scanning over depth 1
             .git_ignore(git_ignore)
@@ -536,43 +490,39 @@ pub mod completers {
                         path.push("");
                     }
 
-                    let path = path.to_str()?.to_owned();
-                    Some((end.clone(), Cow::from(path)))
+                    let path = path.into_os_string().into_string().ok()?;
+                    Some(Cow::from(path))
                 })
             }) // TODO: unwrap or skip
-            .filter(|(_, path)| !path.is_empty()) // TODO
-            .collect();
+            .filter(|path| !path.is_empty());
 
         // if empty, return a list of dirs and files in current dir
         if let Some(file_name) = file_name {
-            let matcher = Matcher::default();
-
-            // inefficient, but we need to calculate the scores, filter out None, then sort.
-            let mut matches: Vec<_> = files
-                .into_iter()
-                .filter_map(|(_range, file)| {
-                    matcher
-                        .fuzzy_match(&file, &file_name)
-                        .map(|score| (file, score))
-                })
-                .collect();
-
             let range = (input.len().saturating_sub(file_name.len()))..;
-
-            matches.sort_unstable_by(|(file1, score1), (file2, score2)| {
-                (Reverse(*score1), file1).cmp(&(Reverse(*score2), file2))
-            });
-
-            files = matches
+            fuzzy_match(&file_name, files, true)
                 .into_iter()
-                .map(|(file, _)| (range.clone(), file))
-                .collect();
+                .map(|(name, _)| (range.clone(), name))
+                .collect()
 
             // TODO: complete to longest common match
         } else {
+            let mut files: Vec<_> = files.map(|file| (end.clone(), file)).collect();
             files.sort_unstable_by(|(_, path1), (_, path2)| path1.cmp(path2));
+            files
         }
+    }
 
-        files
+    pub fn register(editor: &Editor, input: &str) -> Vec<Completion> {
+        let iter = editor
+            .registers
+            .iter_preview()
+            // Exclude special registers that shouldn't be written to
+            .filter(|(ch, _)| !matches!(ch, '%' | '#' | '.'))
+            .map(|(ch, _)| ch.to_string());
+
+        fuzzy_match(input, iter, false)
+            .into_iter()
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
     }
 }

@@ -7,6 +7,7 @@ pub mod config;
 pub mod diagnostic;
 pub mod diff;
 pub mod doc_formatter;
+pub mod fuzzy;
 pub mod graphemes;
 pub mod history;
 pub mod increment;
@@ -16,7 +17,6 @@ pub mod macros;
 pub mod match_brackets;
 pub mod movement;
 pub mod object;
-pub mod path;
 mod position;
 pub mod search;
 pub mod selection;
@@ -37,9 +37,6 @@ pub mod unicode {
 
 pub use helix_loader::find_workspace;
 
-pub fn find_first_non_whitespace_char(line: RopeSlice) -> Option<usize> {
-    line.chars().position(|ch| !ch.is_whitespace())
-}
 mod rope_reader;
 
 pub use rope_reader::RopeReader;
