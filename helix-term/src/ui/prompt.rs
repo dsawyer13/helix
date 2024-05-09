@@ -102,8 +102,8 @@ impl Prompt {
     pub fn prompt(&self) -> &str {
         self.prompt.as_ref()
     }
-    
-    pub fn with_language(mut self, language: &'static str, loader: Arc<syntax::Loader>) -> Self {
+
+    pub fn with_language(mut self, language: &'static str, loader: Arc<ArcSwap<syntax::Loader>>) -> Self {
         self.language = Some((language, loader));
         self
     }
